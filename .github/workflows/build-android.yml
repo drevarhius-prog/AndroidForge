@@ -363,6 +363,89 @@ jobs:
           cat "$GITHUB_WORKSPACE/collect.json"
 
       # ---------------------------------------------------------------------
+      # Step 12b: Sign release APKs with a persistent encrypted keystore
+      # Only the encrypted keystore is stored in the repository.
+      # The decryption password is kept in the Actions secret.
+      # ---------------------------------------------------------------------
+      - name: Sign release APKs
+        if: inputs.build_variant == 'release' && steps.collect.outputs.apk_count != '0' && steps.collect.outputs.apk_count != ''
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ]; then
+            echo "::error::Repository secret ANDROID_KEYSTORE_PASSWORD is missing."
+            exit 1
+          fi
+
+          KEYSTORE_DIR="$GITHUB_WORKSPACE/.github/signing"
+          KEYSTORE_ENC="$KEYSTORE_DIR/release-keystore.p12.enc"
+          KEYSTORE="/tmp/androidforge-release-keystore.p12"
+          mkdir -p "$KEYSTORE_DIR"
+
+          if [ -f "$KEYSTORE_ENC" ]; then
+            echo "Decrypting existing release keystore..."
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+              -in "$KEYSTORE_ENC" -out "$KEYSTORE" \
+              -pass env:ANDROID_KEYSTORE_PASSWORD
+          else
+            echo "Creating persistent release keystore..."
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE" -storetype PKCS12 \
+              -keyalg RSA -keysize 3072 -validity 10000 \
+              -alias androidforge-release \
+              -dname "CN=AndroidForge Release, OU=Personal, O=Personal, L=Ho Chi Minh City, ST=Ho Chi Minh, C=VN" \
+              -storepass:env ANDROID_KEYSTORE_PASSWORD \
+              -keypass:env ANDROID_KEYSTORE_PASSWORD
+
+            openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+              -in "$KEYSTORE" -out "$KEYSTORE_ENC" \
+              -pass env:ANDROID_KEYSTORE_PASSWORD
+
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -f "$KEYSTORE_ENC"
+            git commit -m "Add encrypted Android release signing keystore"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          ZIPALIGN="$BUILD_TOOLS/zipalign"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          if [ ! -x "$ZIPALIGN" ] || [ ! -x "$APKSIGNER" ]; then
+            echo "::error::Android zipalign/apksigner tools were not found."
+            exit 1
+          fi
+
+          APK_DIR="${{ steps.collect.outputs.apk_directory }}"
+          shopt -s nullglob
+          APK_FILES=("$APK_DIR"/*.apk)
+          if [ "${#APK_FILES[@]}" -eq 0 ]; then
+            echo "::error::No APK files found in $APK_DIR."
+            exit 1
+          fi
+
+          for APK in "${APK_FILES[@]}"; do
+            ALIGNED="${APK%.apk}-aligned.apk"
+            SIGNED="${APK%.apk}-signed.apk"
+            echo "Aligning and signing $(basename "$APK")..."
+            "$ZIPALIGN" -f -p 4 "$APK" "$ALIGNED"
+            "$APKSIGNER" sign \
+              --ks "$KEYSTORE" \
+              --ks-key-alias androidforge-release \
+              --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+              --key-pass env:ANDROID_KEYSTORE_PASSWORD \
+              --out "$SIGNED" "$ALIGNED"
+            "$APKSIGNER" verify --verbose "$SIGNED"
+            mv "$SIGNED" "$APK"
+            rm -f "$ALIGNED"
+            echo "Signed and verified: $(basename "$APK")"
+          done
+          rm -f "$KEYSTORE"
+
+      # ---------------------------------------------------------------------
       # Step 13: Upload APK artifact
       # ---------------------------------------------------------------------
       - name: Upload APK artifact
